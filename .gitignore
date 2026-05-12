@@ -1,2 +1,15 @@
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+desktop.ini
+CLAUDE.md

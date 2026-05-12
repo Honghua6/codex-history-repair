@@ -6,13 +6,11 @@ from __future__ import annotations
 
 import collections
 import datetime as dt
-import json
 import os
 import sqlite3
 import subprocess
 import sys
 import threading
-import time
 import traceback
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -88,13 +86,6 @@ def latest_log_tail(path: Path, lines: int = 18) -> str:
     return "\n".join(text[-lines:])
 
 
-def write_repair_log(message: str) -> None:
-    REPAIR_LOG.parent.mkdir(parents=True, exist_ok=True)
-    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with REPAIR_LOG.open("a", encoding="utf-8") as handle:
-        handle.write(f"[{stamp}] {message}\n")
-
-
 def create_gui_shortcut() -> Path:
     desktop = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
     link_path = desktop / "Codex History Repair.lnk"
@@ -117,6 +108,7 @@ class RepairGui(tk.Tk):
         self.diagnosis_running = False
         self.repair_running = False
         self.watcher_running = False
+        self.watcher_process = None
         self.export_running = False
         self._last_log_text = ""
         self.title(APP_TITLE)
@@ -124,9 +116,10 @@ class RepairGui(tk.Tk):
         self.minsize(860, 620)
         self.configure(bg="#f6f7f9")
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)
         self._setup_style()
         self._build_ui()
+        self.set_health_banner("idle", "等待诊断", "点击“刷新诊断”检查当前状态。")
         self.after(200, self.refresh_diagnostics)
         self.after(2500, self.refresh_log_loop)
 
@@ -171,8 +164,44 @@ class RepairGui(tk.Tk):
             style="Hint.TLabel",
         ).grid(row=1, column=3, columnspan=3, sticky="w", padx=(6, 0), pady=(10, 0))
 
+        banner = tk.Frame(self, bg="#f3f4f6", highlightthickness=1, highlightbackground="#d1d5db")
+        banner.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
+        banner.columnconfigure(1, weight=1)
+        self.health_icon_var = tk.StringVar(value="-")
+        self.health_title_var = tk.StringVar(value="等待诊断")
+        self.health_detail_var = tk.StringVar(value="")
+        self.health_icon_label = tk.Label(
+            banner,
+            textvariable=self.health_icon_var,
+            font=("Segoe UI", 18, "bold"),
+            bg="#f3f4f6",
+            fg="#374151",
+            width=4,
+            anchor="center",
+        )
+        self.health_icon_label.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(14, 10), pady=10)
+        self.health_title_label = tk.Label(
+            banner,
+            textvariable=self.health_title_var,
+            font=("Segoe UI", 12, "bold"),
+            bg="#f3f4f6",
+            fg="#111827",
+            anchor="w",
+        )
+        self.health_title_label.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=(10, 2))
+        self.health_detail_label = tk.Label(
+            banner,
+            textvariable=self.health_detail_var,
+            font=("Segoe UI", 10),
+            bg="#f3f4f6",
+            fg="#4b5563",
+            anchor="w",
+            justify="left",
+        )
+        self.health_detail_label.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=(0, 10))
+
         main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        main.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        main.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 12))
 
         left = ttk.Frame(main, style="Card.TFrame", padding=12)
         right = ttk.Frame(main, style="Card.TFrame", padding=12)
@@ -192,7 +221,7 @@ class RepairGui(tk.Tk):
         self.log_text.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
 
         footer = ttk.Frame(self, padding=(18, 0, 18, 14))
-        footer.grid(row=3, column=0, sticky="ew")
+        footer.grid(row=4, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(footer, textvariable=self.status_var, style="Hint.TLabel").grid(row=0, column=0, sticky="w")
@@ -200,11 +229,44 @@ class RepairGui(tk.Tk):
     def set_status(self, text: str) -> None:
         self.status_var.set(text)
 
+    def set_health_banner(self, state: str, title: str, detail: str = "") -> None:
+        palette = {
+            "idle": {"bg": "#f3f4f6", "border": "#d1d5db", "title": "#111827", "detail": "#4b5563", "icon": "-"},
+            "busy": {"bg": "#eff6ff", "border": "#bfdbfe", "title": "#1d4ed8", "detail": "#2563eb", "icon": "..."},
+            "healthy": {"bg": "#ecfdf3", "border": "#a7f3d0", "title": "#166534", "detail": "#15803d", "icon": "OK"},
+            "repair": {"bg": "#fef2f2", "border": "#fecaca", "title": "#991b1b", "detail": "#b91c1c", "icon": "!"},
+            "warning": {"bg": "#fff7ed", "border": "#fed7aa", "title": "#9a3412", "detail": "#c2410c", "icon": "!"},
+            "error": {"bg": "#fef2f2", "border": "#fca5a5", "title": "#991b1b", "detail": "#b91c1c", "icon": "X"},
+        }
+        colors = palette.get(state, palette["idle"])
+        self.health_icon_var.set(colors["icon"])
+        self.health_title_var.set(title)
+        self.health_detail_var.set(detail)
+        self.health_icon_label.configure(bg=colors["bg"], fg=colors["title"])
+        self.health_title_label.configure(bg=colors["bg"], fg=colors["title"])
+        self.health_detail_label.configure(bg=colors["bg"], fg=colors["detail"])
+        self.health_icon_label.master.configure(bg=colors["bg"], highlightbackground=colors["border"])
+
     def set_text(self, widget: tk.Text, text: str) -> None:
         widget.configure(state="normal")
         widget.delete("1.0", tk.END)
         widget.insert("1.0", text)
         widget.configure(state="disabled")
+
+    def set_diagnosis_text(self, text: str, needs_repair: bool) -> None:
+        self.diagnosis.configure(state="normal")
+        self.diagnosis.delete("1.0", tk.END)
+        self.diagnosis.insert("1.0", text)
+        self.diagnosis.tag_configure("status_ok", foreground="#166534", font=("Consolas", 10, "bold"))
+        self.diagnosis.tag_configure("status_bad", foreground="#b91c1c", font=("Consolas", 10, "bold"))
+        self.diagnosis.tag_configure("reason_line", foreground="#9a3412")
+        for index, line in enumerate(text.splitlines(), 1):
+            if line.startswith("修复建议:"):
+                tag = "status_bad" if needs_repair else "status_ok"
+                self.diagnosis.tag_add(tag, f"{index}.0", f"{index}.end")
+            elif line.startswith("原因:"):
+                self.diagnosis.tag_add("reason_line", f"{index}.0", f"{index}.end")
+        self.diagnosis.configure(state="disabled")
 
     def provider_mode(self) -> str:
         return self.target_provider_var.get().strip() or "current"
@@ -224,24 +286,34 @@ class RepairGui(tk.Tk):
             return
         self.diagnosis_running = True
         self.set_status("正在后台诊断...")
+        self.set_health_banner("busy", "正在诊断", "正在检查本地 UI 索引、provider 和 SQLite 状态。")
         target_mode = self.provider_mode()
 
         def worker() -> None:
             try:
-                text = self.build_diagnostics_text(target_mode)
-                self.after(0, lambda: self.set_text(self.diagnosis, text))
+                report = self.build_diagnostics_report(target_mode)
+                self.after(0, lambda report=report: self.set_diagnosis_text(str(report["text"]), bool(report["needs_repair"])))
+                self.after(
+                    0,
+                    lambda report=report: self.set_health_banner(
+                        "repair" if bool(report["needs_repair"]) else "healthy",
+                        "需要修复" if bool(report["needs_repair"]) else "看起来正常",
+                        str(report["reason"]),
+                    ),
+                )
                 self.after(0, lambda: self.set_status("诊断已刷新"))
             except Exception as exc:
                 trace = traceback.format_exc()
                 message = str(exc)
                 self.after(0, lambda: self.set_text(self.diagnosis, trace))
+                self.after(0, lambda message=message: self.set_health_banner("error", "诊断失败", message))
                 self.after(0, lambda message=message: self.set_status(f"诊断失败: {message}"))
             finally:
                 self.diagnosis_running = False
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def build_diagnostics_text(self, target_mode: str) -> str:
+    def build_diagnostics_report(self, target_mode: str) -> dict[str, object]:
         try:
             codex_home = Path(self.config_data["codex_home"]).expanduser()
             provider_options = ["current", *keeper.known_provider_names(codex_home)]
@@ -286,7 +358,7 @@ class RepairGui(tk.Tk):
 
             lines.extend(["", f"修复建议: {'需要修复' if needs_repair else '看起来正常'}"])
             lines.append(f"原因: {reason}")
-            return "\n".join(lines)
+            return {"text": "\n".join(lines), "needs_repair": needs_repair, "reason": reason}
         except Exception as exc:
             raise exc
 
@@ -297,41 +369,45 @@ class RepairGui(tk.Tk):
             self.set_text(self.log_text, text)
         self.after(2500, self.refresh_log_loop)
 
+    def poll_watcher_process(self) -> None:
+        proc = self.watcher_process
+        if proc is None:
+            self.watcher_running = False
+            return
+        if proc.poll() is None:
+            self.watcher_running = True
+            self.after(1500, self.poll_watcher_process)
+            return
+        self.watcher_running = False
+        self.watcher_process = None
+        if proc.returncode not in (0, None):
+            self.set_health_banner("warning", "等待修复已退出", "后台等待修复进程提前结束，请查看右侧日志。")
+            self.set_status("等待修复进程已退出，请查看日志")
+        else:
+            self.set_health_banner("idle", "等待修复已结束", "可以重新诊断，或按需再次启动等待修复。")
+            self.set_status("等待修复进程已结束，可按需重新启动")
+
     def start_watcher(self) -> None:
-        if self.watcher_running:
-            self.set_status("已经在等待 Codex 关闭，请直接关闭 Codex")
+        if self.repair_running:
+            self.set_health_banner("warning", "正在修复", "当前已有修复任务在后台运行，请稍候。")
+            self.set_status("正在后台修复，请稍候")
+            return
+        if not keeper.codex_processes_running():
+            messagebox.showinfo(APP_TITLE, "Codex 当前没有在运行。\n\n请直接使用“立即修复”，或先打开 Codex 再使用“关闭后自动修复”。")
+            self.set_health_banner("warning", "Codex 未运行", "当前更适合直接使用“立即修复”。")
+            self.set_status("Codex 当前未运行，请改用立即修复")
+            return
+        existing = self.watcher_process
+        if existing is not None and existing.poll() is None:
+            self.set_health_banner("busy", "等待关闭中", "后台已在等待 Codex 关闭，请直接关闭 Codex。")
+            self.watcher_running = True
+            self.set_status("已启动外部等待修复，请直接关闭 Codex")
             return
         self.watcher_running = True
-        target_mode = self.provider_mode()
-        self.set_status("已开始等待：请关闭 Codex，关闭后会自动修复并重启")
-
-        def worker() -> None:
-            try:
-                write_repair_log(f"GUI watcher started with provider mode: {target_mode}")
-                while keeper.codex_processes_running():
-                    time.sleep(1.0)
-                time.sleep(2.0)
-                result = keeper.repair_ui_index(self.config_data, apply=True, provider_mode=target_mode)
-                write_repair_log(f"GUI watcher repaired {result.session_count} sessions; provider={result.current_provider}")
-                keeper.launch_codex(self.config_data)
-                self.after(0, lambda: self.set_status(f"修复完成并已重启 Codex：{result.session_count} 条会话"))
-                self.after(0, self.refresh_diagnostics)
-            except Exception as exc:
-                message = str(exc)
-                write_repair_log(traceback.format_exc())
-                self.after(0, lambda message=message: messagebox.showerror(APP_TITLE, message))
-                self.after(0, lambda: self.set_status("自动修复失败"))
-            finally:
-                self.watcher_running = False
-
-        threading.Thread(target=worker, daemon=True).start()
-        return
-
-    def start_external_watcher(self) -> None:
         try:
             if not WATCHER_SCRIPT.exists():
                 raise FileNotFoundError(WATCHER_SCRIPT)
-            subprocess.Popen(
+            self.watcher_process = subprocess.Popen(
                 [
                     "powershell.exe",
                     "-NoProfile",
@@ -344,16 +420,29 @@ class RepairGui(tk.Tk):
                 ],
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0,
             )
+            self.set_health_banner("busy", "等待关闭后自动修复", "请关闭 Codex，工具会在关闭后自动修复并重新打开。")
             self.set_status("已启动等待修复：请关闭 Codex，工具会自动修复并重新打开")
+            self.after(1500, self.poll_watcher_process)
         except Exception as exc:
+            self.watcher_running = False
+            self.watcher_process = None
             messagebox.showerror(APP_TITLE, str(exc))
+            self.set_health_banner("error", "启动等待修复失败", str(exc))
             self.set_status("启动等待修复失败")
 
     def apply_now(self) -> None:
         if self.repair_running:
+            self.set_health_banner("warning", "正在修复", "已有修复任务正在后台运行。")
             self.set_status("修复正在后台进行...")
             return
+        existing = self.watcher_process
+        if existing is not None and existing.poll() is None:
+            self.set_health_banner("warning", "已有等待修复任务", "请先关闭 Codex，让现有后台任务完成。")
+            self.set_status("已启动关闭后自动修复，请先关闭 Codex")
+            messagebox.showinfo(APP_TITLE, "已存在一个“关闭后自动修复”任务。\n\n请先关闭 Codex，让后台任务完成；如果要立即修复，请先等待该任务结束。")
+            return
         self.repair_running = True
+        self.set_health_banner("busy", "正在修复", "正在重建 UI 索引并准备写回本地状态。")
         self.set_status("正在后台修复...")
         target_mode = self.provider_mode()
 
@@ -364,15 +453,18 @@ class RepairGui(tk.Tk):
                         0,
                         lambda: messagebox.showwarning(APP_TITLE, "Codex 正在运行。\n\n请先关闭 Codex，或点击“关闭后自动修复”。"),
                     )
+                    self.after(0, lambda: self.set_health_banner("warning", "Codex 正在运行", "请先关闭 Codex，或改用“关闭后自动修复”。"))
                     self.after(0, lambda: self.set_status("Codex 正在运行，已暂停立即修复"))
                     return
                 result = keeper.repair_ui_index(self.config_data, apply=True, provider_mode=target_mode)
+                self.after(0, lambda: self.set_health_banner("healthy", "修复完成", f"已修复 {result.session_count} 条会话，建议再看一眼最新诊断。"))
                 self.after(0, lambda: self.set_status(f"修复完成：{result.session_count} 条会话，备份在 {result.backup_dir}"))
                 self.after(0, self.refresh_diagnostics)
                 self.after(0, lambda: messagebox.showinfo(APP_TITLE, "修复完成。现在可以打开 Codex。"))
             except Exception as exc:
                 message = str(exc)
                 self.after(0, lambda message=message: messagebox.showerror(APP_TITLE, message))
+                self.after(0, lambda message=message: self.set_health_banner("error", "修复失败", message))
                 self.after(0, lambda: self.set_status("修复失败"))
             finally:
                 self.repair_running = False
@@ -384,15 +476,18 @@ class RepairGui(tk.Tk):
             self.set_status("对话备份正在后台进行...")
             return
         self.export_running = True
+        self.set_health_banner("busy", "正在备份", "正在导出本地对话历史到备份目录。")
         self.set_status("正在备份对话...")
 
         def worker() -> None:
             try:
                 result = keeper.sync_vault(self.config_data)
+                self.after(0, lambda: self.set_health_banner("healthy", "备份完成", f"已导出 {result.session_count} 条对话。"))
                 self.after(0, lambda: self.set_status(f"已备份 {result.session_count} 条对话到 {result.out_dir}"))
             except Exception as exc:
                 message = str(exc)
                 self.after(0, lambda message=message: messagebox.showerror(APP_TITLE, message))
+                self.after(0, lambda message=message: self.set_health_banner("error", "备份失败", message))
                 self.after(0, lambda: self.set_status("备份失败"))
             finally:
                 self.export_running = False

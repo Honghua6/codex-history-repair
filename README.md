@@ -1,90 +1,276 @@
-# Codex History Keeper
+# Codex History Repair
 
-这是一个安全版的 Codex 本地历史恢复工具。
+`Codex History Repair` 是一个给 Windows 用户用的本地工具，解决两件事：
 
-它不会修改 `auth.json`、cookie、账号令牌或正在运行的 SQLite 数据库。它做的事情是把本机 `~/.codex/sessions`、`~/.codex/archived_sessions`、`session_index.jsonl` 里的可读对话导出到：
+1. 把本机里的 Codex 对话历史导出成可读备份。
+2. 修复 Codex 左侧历史列表看不到旧对话的问题。
 
-`C:\Users\honghua\Documents\CodexHistoryVault`
+它适合这些情况：
 
-## 打开界面
+- 你切换了账号、登录方式或 provider 以后，Codex 左侧历史列表变空了
+- 你知道旧对话文件还在电脑里，但 UI 不显示
+- 你想先把本地历史备份成 Markdown / JSON，再慢慢排查
+
+## 先记住两件事
+
+1. **先备份，再修复。**
+   备份不会改你的 Codex，本地修复会改本地 UI 索引。
+
+2. **普通用户最推荐直接双击这个文件：**
+   [`open_codex_history_repair_gui.cmd`](./open_codex_history_repair_gui.cmd)
+
+## 这个工具不会做什么
+
+它不会：
+
+- 迁移云端账号历史
+- 修改 `auth.json`
+- 复制 token、cookie、登录凭据
+- 承诺不同账号之间自动共享官方历史
+
+它做的是：
+
+- 从你电脑里的 `~/.codex` 读取本地历史
+- 导出可读备份
+- 必要时重建本地历史列表索引
+
+## 最简单的使用方法
+
+### 第 1 步：打开工具
+
+双击：
+
+[`open_codex_history_repair_gui.cmd`](./open_codex_history_repair_gui.cmd)
+
+如果你的电脑还没有合适的 Python，或者没有 `tkinter`，启动器会自动检测，并尽量提示你自动安装。
+
+### 第 2 步：先备份
+
+打开 GUI 后，先点击：
+
+`备份对话`
+
+备份完成后，再点击：
+
+`查看备份`
+
+确认能看到这些文件：
+
+- `index.md`
+- `index.json`
+- `searchable_messages.jsonl`
+- `conversations/*.md`
+- `conversations/*.json`
+
+默认备份位置：
+
+`%USERPROFILE%\Documents\CodexHistoryVault`
+
+### 第 3 步：看诊断结果
+
+点击：
+
+`刷新诊断`
+
+现在界面会给出一个很明显的状态提示：
+
+- 绿色：`看起来正常`
+- 红色：`需要修复`
+- 蓝色：正在诊断 / 正在修复
+- 红色或橙色：失败 / 警告
+
+### 第 4 步：如果需要修复，就按提示处理
+
+如果诊断显示 `需要修复`，有两种常用方式。
+
+#### 方式 A：Codex 已经关掉了
+
+直接点击：
+
+`立即修复`
+
+修复完成后，再打开 Codex 看左侧历史是否恢复。
+
+#### 方式 B：Codex 还开着
+
+你有两种选择：
+
+1. 先关掉 Codex，再点 `立即修复`
+2. 先点 `关闭后自动修复`，再去关闭 Codex
+
+第二种适合不想自己卡时间的人。工具会等 Codex 完全退出后自动修复，然后再重新打开 Codex。
+
+## GUI 里每个按钮是做什么的
+
+- `刷新诊断`
+  检查本地 UI 索引、provider、SQLite 状态
+
+- `立即修复`
+  立刻重建本地 UI 索引
+
+- `关闭后自动修复`
+  先进入等待状态，等你关闭 Codex 后再自动修复
+
+- `备份对话`
+  导出本地历史为可读备份
+
+- `查看备份`
+  打开最近一次备份目录
+
+- `创建桌面图标`
+  在桌面创建 GUI 快捷方式
+
+## 什么时候必须关闭 Codex
+
+下面这些操作前，**必须先让 Codex 完全退出**：
+
+- `立即修复`
+- 双击 [`repair_codex_ui_index.cmd`](./repair_codex_ui_index.cmd)
+- 运行 `--repair-ui-index --apply-repair`
+
+因为这些操作会替换本地 `state_5.sqlite`。
+
+下面这个操作不要求你先手动关闭：
+
+- `关闭后自动修复`
+
+因为它本来就是专门等 Codex 关闭后再执行。
+
+下面这个操作通常不需要关闭 Codex：
+
+- `备份对话`
+
+## 修复时到底会改什么
+
+修复主要会重建这些本地文件：
+
+- `state_5.sqlite`
+- `session_index.jsonl`
+- `.codex-global-state.json`（如果存在）
+
+默认修复模式下，工具还会把旧会话里的 `model_provider` 调整到**当前正在使用的 provider**，这样旧会话更容易重新显示在当前 UI 里。
+
+这是这个项目的设计行为，不是意外副作用。
+
+修复前会先自动备份原始状态文件。
+
+默认备份位置：
+
+`%USERPROFILE%\.codex\history_sync_backups`
+
+## 如果没有 Python 或没有 tkinter
+
+最推荐还是直接双击：
+
+[`open_codex_history_repair_gui.cmd`](./open_codex_history_repair_gui.cmd)
+
+它会按这个顺序处理：
+
+1. 查找 Python 3.11+
+2. 检查该 Python 是否带 `tkinter`
+3. 如果缺失，询问你是否自动安装官方 Python 3.13
+4. 安装完成后再次尝试启动 GUI
+
+如果系统没有 `winget`，它会提示你手动去 Python 官网安装：
+
+[Python for Windows](https://www.python.org/downloads/windows/)
+
+安装时请确保包含 `Tcl/Tk`。
+
+## 推荐使用顺序
+
+### 情况 1：你只想先把历史保住
+
+1. 双击打开 GUI
+2. 点击 `备份对话`
+3. 点击 `查看备份`
+4. 确认 `index.md` 和 `conversations` 已生成
+
+### 情况 2：左侧历史列表空了
+
+1. 先 `备份对话`
+2. 再 `刷新诊断`
+3. 如果提示 `需要修复`
+4. 关闭 Codex
+5. 点击 `立即修复`
+6. 重新打开 Codex 检查结果
+
+### 情况 3：你不在乎左侧列表，只想继续看旧内容
+
+直接打开备份目录里的：
+
+- `index.md`
+- `conversations/*.md`
+- `searchable_messages.jsonl`
+
+就可以继续搜索、阅读和引用旧对话。
+
+## 高级用法（命令行）
+
+先进入项目目录：
 
 ```powershell
-python .\tools\codex_history_keeper.py
+Set-Location "<项目目录>"
 ```
 
-更推荐使用新的专用修复界面：
+查看帮助：
 
 ```powershell
-python .\tools\codex_history_repair_gui.py
+py -3 .\codex_history_keeper.py --help
 ```
 
-也可以双击：
-
-`C:\Users\honghua\Documents\New project 4\tools\open_codex_history_repair_gui.cmd`
-
-我已经创建了桌面图标：
-
-`C:\Users\honghua\Desktop\Codex History Repair.lnk`
-
-界面里可以：
-
-- 备份本地历史对话
-- 搜索旧对话
-- 打开最新导出的 `index.md`
-- 创建桌面启动器：先刷新历史，再启动 Codex
-- 安装或移除 Windows 登录后的自动同步
-- 检查或修复 Codex 左侧列表使用的本地 UI 索引
-
-## 每次打开 Codex 前自动刷新
-
-运行一次：
+只导出备份：
 
 ```powershell
-python .\tools\codex_history_keeper.py --install-launcher
+py -3 .\codex_history_keeper.py --sync
 ```
 
-之后从桌面的 `Codex History Launcher` 打开 Codex。它会先把本机历史备份到可读目录，再启动 Codex。
-
-新版启动器还会在启动前检查 UI 索引：如果 `state_5.sqlite` 损坏、缺少本地会话，或旧会话 provider 与当前登录方式不一致，会先自动重建索引再启动。
-
-## 切换登录方式后怎么用
-
-如果新登录方式的左侧历史列表看不到旧会话，打开对话备份目录里的：
-
-`_reuse_this_history_in_codex.md`
-
-把里面的路径告诉新会话，或直接让 Codex 搜索这个备份目录。旧会话的 Markdown 文件在 `conversations` 目录里。
-
-## 左侧列表仍然没有旧对话
-
-如果 Codex 左侧项目里仍显示“暂无对话”，先在界面里点 `检查 UI 索引`。如果检查通过，完全退出 Codex，然后在外部 PowerShell 里运行：
+关闭 Codex 后直接修复 UI 索引：
 
 ```powershell
-python "C:\Users\honghua\Documents\New project 4\tools\codex_history_keeper.py" --repair-ui-index --apply-repair
+py -3 .\codex_history_keeper.py --repair-ui-index --apply-repair
 ```
 
-也可以直接双击：
-
-`C:\Users\honghua\Documents\New project 4\tools\repair_codex_ui_index.cmd`
-
-默认会自动读取当前 Codex 配置里的 provider。官方账号登录通常是 `openai`；API Key 模式会读取 `model_provider`，例如 `my_codex`、`sub2api` 等：
+如果你明确想保留原始 provider，不统一到当前 provider：
 
 ```powershell
-python "C:\Users\honghua\Documents\New project 4\tools\codex_history_keeper.py" --repair-ui-index --apply-repair --provider-mode current
+py -3 .\codex_history_keeper.py --repair-ui-index --apply-repair --provider-mode preserve
 ```
 
-如果需要手动指定某个 API provider，可以把最后的 `current` 换成实际名称，例如 `my_codex`。
+## 常见问题
 
-这个命令会：
+### 1. 修复后左侧还是看不到旧对话
 
-- 从 `~\.codex\sessions` 和 `~\.codex\archived_sessions` 重建 `state_5.sqlite`
-- 将会话 JSONL 里的 `session_meta.model_provider` 统一到当前可见 provider，避免 Codex 重启后再次回填成旧 provider
-- 重建 `session_index.jsonl`
-- 在 `~\.codex\history_sync_backups` 里保留修复前备份
-- 默认把旧会话的 `model_provider` 统一成当前配置正在使用的 provider，避免切换账户/API 后被过滤
+先检查这几件事：
 
-如果想保留原来的 provider 元数据，运行：
+1. `~/.codex/sessions` 或 `~/.codex/archived_sessions` 里是否真的还有旧 JSONL
+2. 修复前是否已经做过一次备份
+3. 修复时 Codex 是否完全关闭
+4. 当前 provider 是否和你想显示的历史一致
 
-```powershell
-python "C:\Users\honghua\Documents\New project 4\tools\codex_history_keeper.py" --repair-ui-index --apply-repair --provider-mode preserve
-```
+### 2. PowerShell 里看到中文乱码
+
+这通常是终端编码问题，不一定是文件坏了。
+
+优先直接看 GUI，或者直接打开导出的 `index.md` / `conversations/*.md`。
+
+### 3. 只想恢复内容，不想动本地索引
+
+那就不要修复，直接备份，然后查看导出的 Markdown 文件即可。
+
+## 项目文件说明
+
+- [`open_codex_history_repair_gui.cmd`](./open_codex_history_repair_gui.cmd)
+  普通用户首选入口
+
+- [`repair_codex_ui_index.cmd`](./repair_codex_ui_index.cmd)
+  关闭 Codex 后，一键执行修复
+
+- [`repair_after_codex_closes.ps1`](./repair_after_codex_closes.ps1)
+  等 Codex 关闭后自动修复并重新打开
+
+- [`codex_history_repair_gui.py`](./codex_history_repair_gui.py)
+  图形界面
+
+- [`codex_history_keeper.py`](./codex_history_keeper.py)
+  核心逻辑

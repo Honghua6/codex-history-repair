@@ -20,6 +20,7 @@ import sys
 import threading
 import tomllib
 import traceback
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -243,6 +244,14 @@ def latest_time(values: list[str | None]) -> str | None:
     return max(parsed, key=lambda item: item[0])[1]
 
 
+def earliest_time(values: list[str | None]) -> str | None:
+    parsed = [(parse_datetime(value), value) for value in values if value]
+    parsed = [(stamp, value) for stamp, value in parsed if stamp is not None]
+    if not parsed:
+        return next((value for value in values if value), None)
+    return min(parsed, key=lambda item: item[0])[1]
+
+
 def should_skip_text(text: str) -> bool:
     stripped = text.lstrip()
     return any(stripped.startswith(prefix) for prefix in SKIP_TEXT_PREFIXES)
@@ -254,11 +263,135 @@ def timestamp_from_epoch(value: Any) -> str | None:
     return dt.datetime.fromtimestamp(value, tz=dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def history_prompt_records(prompt_history: dict[str, list[dict[str, Any]]], session_id: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in prompt_history.get(session_id, []):
+        text = item.get("text") or ""
+        if text and not should_skip_text(text):
+            records.append(
+                {
+                    "role": "user",
+                    "timestamp": timestamp_from_epoch(item.get("ts")),
+                    "text": text.rstrip(),
+                    "source": "history.jsonl",
+                }
+            )
+    records.sort(key=lambda record: parse_datetime(record.get("timestamp")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+    return records
+
+
 def summarize_title(text: str, limit: int = 56) -> str:
     single = re.sub(r"\s+", " ", text).strip()
     if len(single) <= limit:
         return single
     return single[: limit - 1].rstrip() + "..."
+
+
+def unique_run_name(prefix: str) -> str:
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return f"{prefix}-{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def normalized_message_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalized_message_key(message: dict[str, Any]) -> tuple[str, str]:
+    return normalized_message_text(message.get("text") or ""), str(message.get("timestamp") or "")
+
+
+def supplement_user_messages(messages: list[dict[str, Any]], candidates: list[dict[str, Any]]) -> bool:
+    seen = {normalized_message_key(message) for message in messages if message.get("role") == "user"}
+    changed = False
+    for candidate in candidates:
+        if candidate.get("role") != "user":
+            continue
+        key = normalized_message_key(candidate)
+        if not key[0] or key in seen:
+            continue
+        messages.append(candidate)
+        seen.add(key)
+        changed = True
+    return changed
+
+
+def sort_messages_by_timestamp(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    utc_min = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    return [
+        message
+        for _, message in sorted(
+            enumerate(messages),
+            key=lambda item: (parse_datetime(item[1].get("timestamp")) or utc_min, item[0]),
+        )
+    ]
+
+
+def message_identity(message: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(message.get("role") or ""),
+        str(message.get("timestamp") or ""),
+        str(message.get("phase") or ""),
+        str(message.get("text") or ""),
+    )
+
+
+def dedupe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for message in sort_messages_by_timestamp(messages):
+        key = message_identity(message)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(message)
+    return merged
+
+
+def title_score(title: str | None, session_id: str) -> tuple[int, int]:
+    text = (title or "").strip()
+    if not text:
+        return (0, 0)
+    if text == session_id:
+        return (1, len(text))
+    return (2, len(text))
+
+
+def choose_better_title(current: str | None, candidate: str | None, session_id: str) -> str:
+    return candidate or current or session_id if title_score(candidate, session_id) > title_score(current, session_id) else current or candidate or session_id
+
+
+def session_priority(session: dict[str, Any]) -> tuple[int, int, int]:
+    updated = parse_datetime(session.get("updated_at"))
+    updated_epoch = int(updated.timestamp()) if updated is not None else 0
+    message_count = int(session.get("message_count") or 0)
+    archived = 1 if "archived_sessions" in str(session.get("source_file") or "") else 0
+    return (message_count, updated_epoch, -archived)
+
+
+def merge_session_records(existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    preferred = existing if session_priority(existing) >= session_priority(candidate) else candidate
+    other = candidate if preferred is existing else existing
+    merged = dict(preferred)
+    merged["messages"] = dedupe_messages(list(existing.get("messages") or []) + list(candidate.get("messages") or []))
+    merged["message_count"] = len(merged["messages"])
+    merged["title"] = choose_better_title(existing.get("title"), candidate.get("title"), str(preferred.get("id") or ""))
+    merged["updated_at"] = latest_time([existing.get("updated_at"), candidate.get("updated_at")])
+    merged["started_at"] = earliest_time([existing.get("started_at"), candidate.get("started_at")])
+    merged["cwd"] = preferred.get("cwd") or other.get("cwd")
+    merged["originator"] = preferred.get("originator") or other.get("originator")
+    merged["cli_version"] = preferred.get("cli_version") or other.get("cli_version")
+    merged["model_provider"] = preferred.get("model_provider") or other.get("model_provider")
+    merged["_source_mtime"] = max(float(existing.get("_source_mtime") or 0.0), float(candidate.get("_source_mtime") or 0.0))
+    source_files: list[str] = []
+    for source in list(existing.get("source_files") or []) + [str(existing.get("source_file") or "")]:
+        if source and source not in source_files:
+            source_files.append(source)
+    for source in list(candidate.get("source_files") or []) + [str(candidate.get("source_file") or "")]:
+        if source and source not in source_files:
+            source_files.append(source)
+    merged["source_files"] = source_files
+    merged["source_file"] = preferred.get("source_file") or other.get("source_file") or ""
+    return merged
 
 
 def parse_session(
@@ -325,25 +458,23 @@ def parse_session(
 
     if not messages:
         messages = fallback_messages
+    else:
+        supplement_user_messages(messages, fallback_messages)
+
+    if session_id in prompt_history:
+        history_messages = [
+            {**record, "text": redact(record["text"], redact_enabled)}
+            for record in history_prompt_records(prompt_history, session_id)
+        ]
+        if supplement_user_messages(messages, history_messages):
+            messages = sort_messages_by_timestamp(messages)
 
     indexed = session_index.get(session_id, {})
     title = indexed.get("thread_name") or ""
-    if not title:
+    if not title or title.strip() == session_id:
         first_user = next((m["text"] for m in messages if m["role"] == "user"), "")
-        title = summarize_title(first_user) if first_user else session_id
-
-    if not messages and session_id in prompt_history:
-        for item in prompt_history[session_id]:
-            text = item.get("text") or ""
-            if text:
-                messages.append(
-                    {
-                        "role": "user",
-                        "timestamp": timestamp_from_epoch(item.get("ts")),
-                        "text": redact(text.rstrip(), redact_enabled),
-                        "source": "history.jsonl",
-                    }
-                )
+        title = summarize_title(first_user) if first_user else (title or session_id)
+    title = redact(title, redact_enabled)
 
     timestamps = [m.get("timestamp") for m in messages]
     updated_at = latest_time([indexed.get("updated_at"), *timestamps])
@@ -361,7 +492,62 @@ def parse_session(
         "updated_at": updated_at,
         "message_count": len(messages),
         "messages": messages,
+        "source_files": [str(path)],
+        "_source_mtime": path.stat().st_mtime,
     }
+
+
+def build_history_only_session(
+    session_id: str,
+    prompt_history: dict[str, list[dict[str, Any]]],
+    session_index: dict[str, dict[str, Any]],
+    codex_home: Path,
+    redact_enabled: bool,
+) -> dict[str, Any] | None:
+    messages = [
+        {**record, "text": redact(record["text"], redact_enabled)}
+        for record in history_prompt_records(prompt_history, session_id)
+    ]
+    if not messages:
+        return None
+    indexed = session_index.get(session_id, {})
+    first_user = next((m["text"] for m in messages if m.get("role") == "user"), "")
+    title = indexed.get("thread_name") or summarize_title(first_user) or session_id
+    title = redact(title, redact_enabled)
+    timestamps = [m.get("timestamp") for m in messages]
+    history_path = codex_home / "history.jsonl"
+    return {
+        "id": session_id,
+        "title": title,
+        "source_file": str(history_path),
+        "source_files": [str(history_path)],
+        "cwd": None,
+        "originator": None,
+        "cli_version": None,
+        "model_provider": None,
+        "started_at": earliest_time(timestamps),
+        "updated_at": latest_time([indexed.get("updated_at"), *timestamps]),
+        "message_count": len(messages),
+        "messages": messages,
+        "_source_mtime": history_path.stat().st_mtime if history_path.exists() else 0.0,
+    }
+
+
+def session_matches_export_filters(
+    session: dict[str, Any],
+    wanted_ids: set[str],
+    since_dt: dt.datetime | None,
+) -> bool:
+    if wanted_ids and str(session.get("id") or "") not in wanted_ids:
+        return False
+    updated = parse_datetime(session.get("updated_at"))
+    if since_dt and updated and updated < since_dt:
+        return False
+    if since_dt and updated is None:
+        source_mtime = float(session.get("_source_mtime") or 0.0)
+        if source_mtime and dt.datetime.fromtimestamp(source_mtime, tz=dt.timezone.utc) < since_dt:
+            return False
+    return int(session.get("message_count") or 0) > 0
 
 
 def to_epoch_seconds(value: str | None, fallback: float | None = None) -> int:
@@ -384,7 +570,7 @@ def to_epoch_millis(value: str | None, fallback: float | None = None) -> int:
 
 def extended_windows_path(path_text: str | None) -> str:
     if not path_text:
-        return r"\\?\C:\Users\honghua"
+        path_text = str(Path.home())
     if not sys.platform.startswith("win"):
         return path_text
     text = str(Path(path_text).expanduser())
@@ -399,7 +585,23 @@ def compact_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
-def extract_repair_metadata(path: Path, indexed: dict[str, Any]) -> dict[str, Any]:
+def repair_source_text(meta: dict[str, Any]) -> str:
+    source = meta.get("source")
+    if isinstance(source, str) and source.strip():
+        return source.strip()
+    if isinstance(source, dict):
+        if source.get("subagent"):
+            return "subagent"
+        if source:
+            return "structured"
+    return "vscode" if meta.get("originator") == "Codex Desktop" else "cli"
+
+
+def extract_repair_metadata(
+    path: Path,
+    indexed: dict[str, Any],
+    prompt_history: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
     session_id = extract_id_from_name(path)
     meta: dict[str, Any] = {}
     turn_context: dict[str, Any] = {}
@@ -433,6 +635,14 @@ def extract_repair_metadata(path: Path, indexed: dict[str, Any]) -> dict[str, An
                 if text and not should_skip_text(text):
                     first_user = text
 
+    if not first_user and prompt_history:
+        first_user = next(
+            (record["text"] for record in history_prompt_records(prompt_history, session_id) if record.get("text")),
+            "",
+        )
+        if first_user:
+            has_user_event = True
+
     title = indexed.get("thread_name") or summarize_title(first_user) or session_id
     created_text = meta.get("timestamp") or path_timestamp_from_name(path) or last_timestamp
     updated_text = latest_time([indexed.get("updated_at"), last_timestamp, created_text])
@@ -453,7 +663,7 @@ def extract_repair_metadata(path: Path, indexed: dict[str, Any]) -> dict[str, An
         "rollout_path": str(path),
         "created_at": to_epoch_seconds(created_text, path.stat().st_ctime),
         "updated_at": to_epoch_seconds(updated_text, path.stat().st_mtime),
-        "source": meta.get("source") or ("vscode" if meta.get("originator") == "Codex Desktop" else "cli"),
+        "source": repair_source_text(meta),
         "model_provider": meta.get("model_provider") or "openai",
         "cwd": extended_windows_path(str(cwd)),
         "title": title,
@@ -478,6 +688,8 @@ def extract_repair_metadata(path: Path, indexed: dict[str, Any]) -> dict[str, An
         "updated_at_ms": to_epoch_millis(updated_text, path.stat().st_mtime),
         "thread_source": None,
         "updated_at_iso": updated_text,
+        "source_files": [str(path)],
+        "_source_mtime": path.stat().st_mtime,
     }
 
 
@@ -510,20 +722,25 @@ def message_heading(message: dict[str, Any]) -> str:
 
 
 def render_session_markdown(session: dict[str, Any], exported_at: str) -> str:
+    source_files = list(session.get("source_files") or [])
+    primary_source = session.get("source_file") or (source_files[0] if source_files else "")
     lines = [
         f"# {markdown_escape_heading(session['title'])}",
         "",
         f"- Session ID: `{session['id']}`",
-        f"- Source file: `{session['source_file']}`",
+        f"- Source file: `{primary_source}`",
         f"- CWD: `{session.get('cwd') or ''}`",
         f"- Started: `{session.get('started_at') or ''}`",
         f"- Updated: `{session.get('updated_at') or ''}`",
         f"- Exported: `{exported_at}`",
         f"- Messages: `{session['message_count']}`",
         "",
-        "## Conversation",
-        "",
     ]
+    if len(source_files) > 1:
+        lines.extend(["## Source Files", ""])
+        lines.extend([f"- `{source}`" for source in source_files])
+        lines.append("")
+    lines.extend(["## Conversation", ""])
     for message in session["messages"]:
         lines.extend(
             [
@@ -548,7 +765,7 @@ def render_index_markdown(sessions: list[dict[str, Any]], exported_at: str, code
         "",
     ]
     for session in sessions:
-        md_name = f"conversations/{session['id']}.md"
+        md_name = str(session.get("markdown") or f"conversations/{session['id']}.md")
         title = markdown_escape_link_text(session["title"])
         updated = session.get("updated_at") or ""
         count = session.get("message_count") or 0
@@ -586,30 +803,29 @@ def export_codex_history(
     since_dt = parse_datetime(since)
     wanted_ids = {item.strip() for item in (thread_ids or []) if item.strip()}
     exported_at = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     if out_dir is None:
-        out_dir = DEFAULT_VAULT_ROOT / f"codex-history-{timestamp}"
+        out_dir = DEFAULT_VAULT_ROOT / unique_run_name("codex-history")
     out_dir = out_dir.expanduser().resolve()
     conversations_dir = out_dir / "conversations"
 
     session_index = load_session_index(codex_home)
     prompt_history = load_prompt_history(codex_home)
-    parsed: list[dict[str, Any]] = []
+    combined: dict[str, dict[str, Any]] = {}
 
     for path in session_files(codex_home):
         session = parse_session(path, session_index, prompt_history, redact_enabled)
-        if wanted_ids and session["id"] not in wanted_ids:
+        session_id = str(session["id"])
+        existing = combined.get(session_id)
+        combined[session_id] = merge_session_records(existing, session) if existing else session
+
+    for session_id in prompt_history:
+        if session_id in combined:
             continue
-        updated = parse_datetime(session.get("updated_at"))
-        if since_dt and updated and updated < since_dt:
-            continue
-        if since_dt and updated is None:
-            mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
-            if mtime < since_dt:
-                continue
-        if session["message_count"] == 0:
-            continue
-        parsed.append(session)
+        history_only = build_history_only_session(session_id, prompt_history, session_index, codex_home, redact_enabled)
+        if history_only is not None:
+            combined[session_id] = history_only
+
+    parsed = [session for session in combined.values() if session_matches_export_filters(session, wanted_ids, since_dt)]
 
     parsed.sort(
         key=lambda item: parse_datetime(item.get("updated_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
@@ -631,14 +847,17 @@ def export_codex_history(
     searchable_path = out_dir / "searchable_messages.jsonl"
     with searchable_path.open("w", encoding="utf-8") as searchable:
         for session in parsed:
-            md_path = conversations_dir / f"{session['id']}.md"
-            json_path = conversations_dir / f"{session['id']}.json"
+            safe_session_id = re.sub(r"[^0-9A-Za-z._-]+", "_", str(session["id"]))
+            md_rel = Path("conversations") / f"{safe_session_id}.md"
+            json_rel = Path("conversations") / f"{safe_session_id}.json"
+            md_path = out_dir / md_rel
+            json_path = out_dir / json_rel
+            session["markdown"] = md_rel.as_posix()
+            session["json"] = json_rel.as_posix()
             md_path.write_text(render_session_markdown(session, exported_at), encoding="utf-8")
             write_json(json_path, session)
 
-            manifest_item = {key: value for key, value in session.items() if key != "messages"}
-            manifest_item["markdown"] = str(md_path)
-            manifest_item["json"] = str(json_path)
+            manifest_item = {key: value for key, value in session.items() if key not in {"messages", "_source_mtime"}}
             manifest.append(manifest_item)
 
             for number, message in enumerate(session["messages"], 1):
@@ -685,18 +904,47 @@ def save_config(config: dict[str, Any]) -> None:
     CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def latest_vault(vault_root: Path) -> Path | None:
-    vault_root = vault_root.expanduser()
-    pointer = vault_root / "_latest.txt"
-    if pointer.exists():
-        candidate = Path(pointer.read_text(encoding="utf-8").strip())
-        if (candidate / "index.md").exists():
-            return candidate
+def valid_vault_path(path: Path) -> bool:
+    try:
+        return path.is_dir() and (path / "index.md").exists()
+    except OSError:
+        return False
+
+
+def local_vault_candidates(vault_root: Path) -> list[Path]:
     if not vault_root.exists():
+        return []
+    return [path for path in vault_root.glob("codex-history-*") if valid_vault_path(path)]
+
+
+def resolve_latest_pointer(vault_root: Path, pointer_text: str) -> Path | None:
+    text = pointer_text.strip()
+    if not text:
         return None
-    candidates = [path for path in vault_root.glob("codex-history-*") if (path / "index.md").exists()]
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = vault_root / candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        resolved = candidate
+    return resolved if valid_vault_path(resolved) else None
+
+
+def latest_vault(vault_root: Path) -> Path | None:
+    vault_root = vault_root.expanduser().resolve()
+    pointer = vault_root / "_latest.txt"
+    pointed = None
+    if pointer.exists():
+        try:
+            pointed = resolve_latest_pointer(vault_root, pointer.read_text(encoding="utf-8"))
+        except OSError as exc:
+            log_line(f"Could not read latest vault pointer {pointer}: {exc}")
+    candidates = local_vault_candidates(vault_root)
     if not candidates:
-        return None
+        return pointed
+    if pointed is not None:
+        return pointed
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
@@ -722,13 +970,12 @@ def write_reuse_prompt(vault_root: Path, latest: Path) -> Path:
 
 def sync_vault(config: dict[str, Any], max_sessions: int | None = None) -> ExportResult:
     codex_home = Path(config["codex_home"]).expanduser()
-    vault_root = Path(config["vault_root"]).expanduser()
+    vault_root = Path(config["vault_root"]).expanduser().resolve()
     vault_root.mkdir(parents=True, exist_ok=True)
-    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_dir = vault_root / f"codex-history-{timestamp}"
+    out_dir = vault_root / unique_run_name("codex-history")
     result = export_codex_history(codex_home=codex_home, out_dir=out_dir, max_sessions=max_sessions)
     pointer = vault_root / "_latest.txt"
-    pointer.write_text(str(result.out_dir), encoding="utf-8")
+    pointer.write_text(result.out_dir.name + "\n", encoding="utf-8")
     write_reuse_prompt(vault_root, result.out_dir)
     log_line(f"Synced {result.session_count} sessions to {result.out_dir}")
     return result
@@ -895,9 +1142,10 @@ def search_records(vault_root: Path, query: str, limit: int = 80) -> list[dict[s
 
 def collect_repair_threads(codex_home: Path, provider_mode: str = "current") -> tuple[list[dict[str, Any]], str]:
     session_index = load_session_index(codex_home)
+    prompt_history = load_prompt_history(codex_home)
     rows: list[dict[str, Any]] = []
     for path in session_files(codex_home):
-        row = extract_repair_metadata(path, session_index.get(extract_id_from_name(path), {}))
+        row = extract_repair_metadata(path, session_index.get(extract_id_from_name(path), {}), prompt_history)
         rows.append(row)
     rows.sort(key=lambda item: item["updated_at_ms"])
     selected_provider = detect_current_provider(codex_home)
@@ -939,6 +1187,71 @@ def read_sqlite_schema(db_path: Path) -> tuple[list[str], list[str], list[str], 
     return tables, indexes, triggers, table_names
 
 
+def fallback_state_schema() -> tuple[list[str], list[str], list[str], list[str]]:
+    tables = [
+        """CREATE TABLE threads (
+    id TEXT PRIMARY KEY,
+    rollout_path TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    model_provider TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    title TEXT NOT NULL,
+    sandbox_policy TEXT NOT NULL,
+    approval_mode TEXT NOT NULL,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    has_user_event INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    archived_at INTEGER,
+    git_sha TEXT,
+    git_branch TEXT,
+    git_origin_url TEXT,
+    cli_version TEXT NOT NULL DEFAULT '',
+    first_user_message TEXT NOT NULL DEFAULT '',
+    agent_nickname TEXT,
+    agent_role TEXT,
+    memory_mode TEXT NOT NULL DEFAULT 'enabled',
+    model TEXT,
+    reasoning_effort TEXT,
+    agent_path TEXT,
+    created_at_ms INTEGER,
+    updated_at_ms INTEGER,
+    thread_source TEXT
+)"""
+    ]
+    indexes = [
+        "CREATE INDEX idx_threads_archived ON threads(archived)",
+        "CREATE INDEX idx_threads_created_at ON threads(created_at DESC, id DESC)",
+        "CREATE INDEX idx_threads_created_at_ms ON threads(created_at_ms DESC, id DESC)",
+        "CREATE INDEX idx_threads_provider ON threads(model_provider)",
+        "CREATE INDEX idx_threads_source ON threads(source)",
+        "CREATE INDEX idx_threads_updated_at ON threads(updated_at DESC, id DESC)",
+        "CREATE INDEX idx_threads_updated_at_ms ON threads(updated_at_ms DESC, id DESC)",
+        "CREATE INDEX idx_threads_archived_cwd_created_at_ms ON threads(archived, cwd, created_at_ms DESC, id DESC)",
+        "CREATE INDEX idx_threads_archived_cwd_updated_at_ms ON threads(archived, cwd, updated_at_ms DESC, id DESC)",
+    ]
+    triggers = [
+        """CREATE TRIGGER threads_created_at_ms_after_insert AFTER INSERT ON threads
+WHEN NEW.created_at_ms IS NULL BEGIN
+    UPDATE threads SET created_at_ms = NEW.created_at * 1000 WHERE id = NEW.id;
+END""",
+        """CREATE TRIGGER threads_created_at_ms_after_update AFTER UPDATE OF created_at ON threads
+WHEN NEW.created_at != OLD.created_at AND NEW.created_at_ms IS OLD.created_at_ms BEGIN
+    UPDATE threads SET created_at_ms = NEW.created_at * 1000 WHERE id = NEW.id;
+END""",
+        """CREATE TRIGGER threads_updated_at_ms_after_insert AFTER INSERT ON threads
+WHEN NEW.updated_at_ms IS NULL BEGIN
+    UPDATE threads SET updated_at_ms = NEW.updated_at * 1000 WHERE id = NEW.id;
+END""",
+        """CREATE TRIGGER threads_updated_at_ms_after_update AFTER UPDATE OF updated_at ON threads
+WHEN NEW.updated_at != OLD.updated_at AND NEW.updated_at_ms IS OLD.updated_at_ms BEGIN
+    UPDATE threads SET updated_at_ms = NEW.updated_at * 1000 WHERE id = NEW.id;
+END""",
+    ]
+    return tables, indexes, triggers, ["threads"]
+
+
 def copy_table_rows(old_db: Path, new_db: Path, table_names: list[str]) -> None:
     skip = {"threads", "thread_dynamic_tools", "stage1_outputs", "thread_goals", "thread_spawn_edges", "sqlite_sequence"}
     src = sqlite3.connect(f"file:{old_db.as_posix()}?mode=ro", uri=True, timeout=10)
@@ -966,12 +1279,35 @@ def copy_table_rows(old_db: Path, new_db: Path, table_names: list[str]) -> None:
         dst.close()
 
 
+def schema_has_required_threads_shape(db_path: Path) -> bool:
+    con = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=10)
+    try:
+        table_names = {str(row[0]) for row in con.execute("select name from sqlite_master where type='table'")}
+        if "threads" not in table_names:
+            return False
+        columns = {str(row[1]) for row in con.execute("pragma table_info(threads)")}
+        required = {"id", "model_provider", "cwd", "title", "updated_at"}
+        return required.issubset(columns)
+    finally:
+        con.close()
+
+
 def create_rebuilt_state_db(codex_home: Path, out_db: Path, provider_mode: str = "current") -> tuple[int, str]:
     old_db = codex_home / "state_5.sqlite"
-    if not old_db.exists():
-        raise FileNotFoundError(f"Missing Codex state DB: {old_db}")
     threads, current_provider = collect_repair_threads(codex_home, provider_mode)
-    tables, indexes, triggers, table_names = read_sqlite_schema(old_db)
+    has_old_db = old_db.exists()
+    if has_old_db:
+        try:
+            tables, indexes, triggers, table_names = read_sqlite_schema(old_db)
+            if not schema_has_required_threads_shape(old_db):
+                raise RuntimeError("state_5.sqlite schema is readable but missing a usable threads table")
+        except Exception as exc:
+            log_line(f"Could not read existing state DB schema from {old_db}; falling back to built-in schema: {exc}")
+            tables, indexes, triggers, table_names = fallback_state_schema()
+            has_old_db = False
+    else:
+        tables, indexes, triggers, table_names = fallback_state_schema()
+        log_line(f"Missing Codex state DB; rebuilding UI index from local session sources: {old_db}")
     if out_db.exists():
         out_db.unlink()
     out_db.parent.mkdir(parents=True, exist_ok=True)
@@ -985,17 +1321,21 @@ def create_rebuilt_state_db(codex_home: Path, out_db: Path, provider_mode: str =
     finally:
         con.close()
 
-    copy_table_rows(old_db, out_db, table_names)
+    if has_old_db:
+        copy_table_rows(old_db, out_db, table_names)
 
     con = sqlite3.connect(str(out_db), timeout=10)
     try:
         con.execute("pragma foreign_keys=off")
         thread_columns = [row[1] for row in con.execute("pragma table_info(threads)")]
-        placeholders = ",".join("?" for _ in thread_columns)
-        quoted_columns = ",".join(f'"{column}"' for column in thread_columns)
-        insert_sql = f'insert or replace into threads ({quoted_columns}) values ({placeholders})'
-        values = [[thread.get(column) for column in thread_columns] for thread in threads]
-        con.executemany(insert_sql, values)
+        thread_keys = set().union(*(thread.keys() for thread in threads)) if threads else set()
+        insert_columns = [column for column in thread_columns if column in thread_keys]
+        if insert_columns:
+            placeholders = ",".join("?" for _ in insert_columns)
+            quoted_columns = ",".join(f'"{column}"' for column in insert_columns)
+            insert_sql = f'insert or replace into threads ({quoted_columns}) values ({placeholders})'
+            values = [[thread.get(column) for column in insert_columns] for thread in threads]
+            con.executemany(insert_sql, values)
         for sql in indexes:
             con.execute(sql)
         for sql in triggers:
@@ -1012,6 +1352,10 @@ def create_rebuilt_state_db(codex_home: Path, out_db: Path, provider_mode: str =
 
 def write_rebuilt_session_index(codex_home: Path, threads: list[dict[str, Any]]) -> None:
     target = codex_home / "session_index.jsonl"
+    atomic_write_text(target, rebuilt_session_index_text(threads))
+
+
+def rebuilt_session_index_text(threads: list[dict[str, Any]]) -> str:
     lines = []
     for thread in sorted(threads, key=lambda item: item["updated_at_ms"]):
         updated = parse_datetime(thread.get("updated_at_iso"))
@@ -1026,13 +1370,18 @@ def write_rebuilt_session_index(codex_home: Path, threads: list[dict[str, Any]])
                 ensure_ascii=False,
             )
         )
-    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return "\n".join(lines) + "\n"
 
 
-def update_saved_workspace_roots(codex_home: Path, threads: list[dict[str, Any]]) -> None:
-    state_path = codex_home / ".codex-global-state.json"
+def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    temp_path = path.with_name(path.name + ".tmp")
+    temp_path.write_text(content, encoding=encoding)
+    os.replace(temp_path, path)
+
+
+def updated_workspace_roots_text(state_path: Path, threads: list[dict[str, Any]]) -> str | None:
     if not state_path.exists():
-        return
+        return None
     data = json.loads(state_path.read_text(encoding="utf-8"))
     roots = list(data.get("electron-saved-workspace-roots") or [])
     order = list(data.get("project-order") or roots)
@@ -1057,7 +1406,14 @@ def update_saved_workspace_roots(codex_home: Path, threads: list[dict[str, Any]]
 
     data["electron-saved-workspace-roots"] = roots
     data["project-order"] = order
-    state_path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def update_saved_workspace_roots(codex_home: Path, threads: list[dict[str, Any]]) -> None:
+    state_path = codex_home / ".codex-global-state.json"
+    content = updated_workspace_roots_text(state_path, threads)
+    if content is not None:
+        atomic_write_text(state_path, content)
 
 
 def windows_process_ids_by_names(names: set[str]) -> list[str]:
@@ -1132,7 +1488,7 @@ def codex_processes_running() -> list[str]:
 
 
 def backup_codex_state_files(codex_home: Path) -> Path:
-    backup_dir = codex_home / "history_sync_backups" / f"ui-index-repair-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    backup_dir = codex_home / "history_sync_backups" / unique_run_name("ui-index-repair")
     backup_dir.mkdir(parents=True, exist_ok=True)
     names = [
         "state_5.sqlite",
@@ -1154,6 +1510,7 @@ def normalize_session_jsonl_provider(codex_home: Path, provider: str, backup_dir
     for path in session_files(codex_home):
         rows: list[str] = []
         file_changed = False
+        saw_session_meta = False
         try:
             with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -1168,12 +1525,25 @@ def normalize_session_jsonl_provider(codex_home: Path, provider: str, backup_dir
                         continue
                     payload = row.get("payload")
                     if row.get("type") == "session_meta" and isinstance(payload, dict):
+                        saw_session_meta = True
                         if payload.get("model_provider") != provider:
                             payload["model_provider"] = provider
                             file_changed = True
                     rows.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
         except FileNotFoundError:
             continue
+
+        if not saw_session_meta:
+            session_id = extract_id_from_name(path)
+            meta_row = {
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "model_provider": provider,
+                },
+            }
+            rows.insert(0, json.dumps(meta_row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            file_changed = True
 
         if file_changed:
             relative = path.relative_to(codex_home)
@@ -1198,22 +1568,57 @@ def repair_ui_index(config: dict[str, Any], apply: bool = False, provider_mode: 
                 "Codex 仍在运行，不能替换 UI 索引。请完全退出 Codex 后，在外部 PowerShell 里重新运行修复命令。"
             )
     backup_dir = backup_codex_state_files(codex_home)
+    provider_for_jsonl = None
     if apply and provider_mode != "preserve":
         _, provider_for_jsonl = collect_repair_threads(codex_home, provider_mode)
-        changed = normalize_session_jsonl_provider(codex_home, provider_for_jsonl, backup_dir)
-        log_line(f"Normalized model_provider={provider_for_jsonl} in {changed} session JSONL file(s)")
     rebuilt_db = backup_dir / "state_5.sqlite.rebuilt"
     count, current_provider = create_rebuilt_state_db(codex_home, rebuilt_db, provider_mode)
     threads, _ = collect_repair_threads(codex_home, provider_mode)
 
     if apply:
-        for name in ("state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"):
-            target = codex_home / name
-            if target.exists():
-                target.unlink()
-        shutil.copy2(rebuilt_db, codex_home / "state_5.sqlite")
-        write_rebuilt_session_index(codex_home, threads)
-        update_saved_workspace_roots(codex_home, threads)
+        session_index_path = codex_home / "session_index.jsonl"
+        global_state_path = codex_home / ".codex-global-state.json"
+        rebuilt_session_index = backup_dir / "session_index.rebuilt.jsonl"
+        rebuilt_session_index.write_text(rebuilt_session_index_text(threads), encoding="utf-8")
+        rebuilt_global_state = None
+        if global_state_path.exists():
+            rebuilt_global_state = backup_dir / ".codex-global-state.rebuilt.json"
+            rebuilt_global_state.write_text(updated_workspace_roots_text(global_state_path, threads) or "{}", encoding="utf-8")
+
+        try:
+            if provider_for_jsonl is not None:
+                changed = normalize_session_jsonl_provider(codex_home, provider_for_jsonl, backup_dir)
+                log_line(f"Normalized model_provider={provider_for_jsonl} in {changed} session JSONL file(s)")
+            for name in ("state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"):
+                target = codex_home / name
+                if target.exists():
+                    target.unlink()
+            shutil.copy2(rebuilt_db, codex_home / "state_5.sqlite")
+            shutil.copy2(rebuilt_session_index, session_index_path)
+            if rebuilt_global_state is not None:
+                shutil.copy2(rebuilt_global_state, global_state_path)
+        except Exception:
+            for name in ("state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"):
+                backup_state = backup_dir / name
+                live_state = codex_home / name
+                if backup_state.exists():
+                    shutil.copy2(backup_state, live_state)
+                elif live_state.exists() and name != "state_5.sqlite":
+                    live_state.unlink()
+            backup_index = backup_dir / "session_index.jsonl"
+            if backup_index.exists():
+                shutil.copy2(backup_index, session_index_path)
+            backup_global = backup_dir / ".codex-global-state.json"
+            if backup_global.exists():
+                shutil.copy2(backup_global, global_state_path)
+            sessions_backup = backup_dir / "session_jsonl_originals"
+            if sessions_backup.exists():
+                for backup_path in sessions_backup.rglob("*.jsonl"):
+                    relative = backup_path.relative_to(sessions_backup)
+                    restore_path = codex_home / relative
+                    restore_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(backup_path, restore_path)
+            raise
         log_line(f"Applied UI index repair with {count} threads; backup={backup_dir}")
     else:
         log_line(f"Created UI index repair preview with {count} threads: {rebuilt_db}")
@@ -1244,12 +1649,14 @@ def needs_ui_index_repair(codex_home: Path, provider_mode: str = "current") -> t
         jsonl_mismatches = 0
         for path in session_files(codex_home):
             provider = None
+            saw_session_meta = False
             for row in read_jsonl(path):
                 payload = row.get("payload") or {}
                 if row.get("type") == "session_meta" and isinstance(payload, dict):
+                    saw_session_meta = True
                     provider = payload.get("model_provider")
                     break
-            if provider != current_provider:
+            if saw_session_meta and provider != current_provider:
                 jsonl_mismatches += 1
         if jsonl_mismatches:
             return True, f"{jsonl_mismatches} session JSONL file(s) use a provider different from {current_provider}"
@@ -1538,7 +1945,7 @@ class KeeperApp(tk.Tk if tk else object):
             self.set_log("UI 索引修复正在后台进行...")
             return
         self.save_from_fields()
-        command = f'python "{SCRIPT_PATH}" --repair-ui-index --apply-repair'
+        command = f'"{sys.executable}" "{SCRIPT_PATH}" --repair-ui-index --apply-repair'
         self.repair_running = True
         self.set_log("正在后台修复 UI 索引...")
 
@@ -1683,7 +2090,11 @@ def main() -> int:
             return 1
 
     if tk is None:
-        print("error: Tkinter is not available. Use --sync for command-line export.", file=sys.stderr)
+        print(
+            "error: Tkinter is not available. On Windows, start the tool with "
+            "`open_codex_history_repair_gui.cmd` to auto-detect or install a Python build that includes tkinter.",
+            file=sys.stderr,
+        )
         return 1
     KeeperApp().mainloop()
     return 0
