@@ -171,11 +171,11 @@
 3. 如果缺失，询问你是否自动安装官方 Python 3.13
 4. 安装完成后再次尝试启动 GUI
 
-如果系统没有 `winget`，它会提示你手动去 Python 官网安装：
+安装时会优先尝试 `winget`。
 
-[Python for Windows](https://www.python.org/downloads/windows/)
+如果系统没有 `winget`，或者 `winget` 安装失败，启动器会继续从 Python 官网自动下载官方 Windows 安装器并静默安装。
 
-安装时请确保包含 `Tcl/Tk`。
+只有在自动下载本身失败时，你才需要检查网络或稍后重试。
 
 ## 推荐使用顺序
 

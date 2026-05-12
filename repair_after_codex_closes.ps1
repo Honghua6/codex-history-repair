@@ -36,7 +36,7 @@ function Get-PythonCommand {
     }
   }
 
-  throw "Python 3.11+ was not found. Install Python 3.11+ from https://www.python.org/downloads/windows/ and try again."
+  throw "Python 3.11+ was not found. Run open_codex_history_repair_gui.cmd or repair_codex_ui_index.cmd to let the launcher install Python automatically, then try again."
 }
 
 function Invoke-Python {
@@ -88,6 +88,6 @@ try {
   }
 } catch {
   Write-RepairLog "Watcher failed: $($_.Exception.Message)"
-  Write-RepairLog "Install Python 3.11+ from https://www.python.org/downloads/windows/ if it is missing, then rerun the watcher."
+  Write-RepairLog "Python is missing. Run open_codex_history_repair_gui.cmd or repair_codex_ui_index.cmd to let the launcher install Python automatically, then rerun the watcher."
   throw
 }

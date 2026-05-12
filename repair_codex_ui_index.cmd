@@ -32,6 +32,16 @@ for %%V in (3.13 3.12 3.11) do (
     exit /b 0
   )
 )
+for %%P in ("%LocalAppData%\Programs\Python\Python313\python.exe" "%LocalAppData%\Programs\Python\Python312\python.exe" "%LocalAppData%\Programs\Python\Python311\python.exe") do (
+  if exist "%%~fP" (
+    "%%~fP" -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>nul
+    if not errorlevel 1 (
+      set "PYTHON_EXE=%%~fP"
+      set "PYTHON_ARGS="
+      exit /b 0
+    )
+  )
+)
 where python >nul 2>nul
 if not errorlevel 1 (
   python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>nul
@@ -46,7 +56,7 @@ exit /b 1
 :python_missing
 echo Python 3.11+ was not found.
 echo.
-echo This tool can try to install Python automatically with winget.
+echo This tool can try to install Python automatically.
 choice /C YN /M "Install Python 3.13 now"
 if errorlevel 2 goto :install_declined
 call :install_python
@@ -67,8 +77,7 @@ exit /b %REPAIR_EXIT%
 
 :install_declined
 echo Installation was cancelled.
-echo Please install Python 3.11+ from https://www.python.org/downloads/windows/
-echo and then run this repair tool again.
+echo You can run this repair tool again whenever you are ready to install Python.
 echo.
 pause
 exit /b 1
@@ -84,22 +93,49 @@ exit /b 1
 :install_python
 where winget >nul 2>nul
 if errorlevel 1 (
-  echo winget is not available on this system.
-  echo Please install Python 3.13 from https://www.python.org/downloads/windows/
-  echo and then run this repair tool again.
-  echo.
-  pause
-  exit /b 1
+  call :install_python_from_web
+  exit /b %errorlevel%
 )
 echo Installing Python 3.13 with winget...
 winget install --id Python.Python.3.13 --exact --accept-package-agreements --accept-source-agreements
 if errorlevel 1 (
-  echo Automatic installation failed.
-  echo Please install Python 3.13 manually from https://www.python.org/downloads/windows/
-  echo and then run this repair tool again.
+  echo winget installation failed. Trying a direct download from python.org...
+  call :install_python_from_web
+  exit /b %errorlevel%
+)
+echo Installation completed. Retrying...
+exit /b 0
+
+:install_python_from_web
+set "PYTHON_INSTALLER_PATH=%TEMP%\codex-history-repair-python-3.13-amd64.exe"
+echo Downloading the official Python installer from python.org...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ProgressPreference='SilentlyContinue';" ^
+  "$releasePage = 'https://www.python.org/downloads/latest/python3.13/';" ^
+  "$pattern = 'https://www\.python\.org/ftp/python/3\.13\.[0-9]+/python-3\.13\.[0-9]+-amd64\.exe';" ^
+  "$response = Invoke-WebRequest -UseBasicParsing $releasePage;" ^
+  "$url = [regex]::Match($response.Content, $pattern).Value;" ^
+  "if (-not $url) { throw 'No official Python 3.13 Windows installer link was found.' }" ^
+  "Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile '%PYTHON_INSTALLER_PATH%';" ^
+  "$item = Get-Item '%PYTHON_INSTALLER_PATH%' -ErrorAction Stop;" ^
+  "if ($item.Length -le 0) { throw 'Downloaded installer is empty.' }"
+if errorlevel 1 (
+  echo Automatic download failed.
+  echo Please check your network connection and try running this repair tool again.
   echo.
   pause
   exit /b 1
 )
+echo Running the downloaded installer...
+"%PYTHON_INSTALLER_PATH%" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_pip=1 Include_tcltk=1 Shortcuts=0
+set "INSTALL_EXIT=%ERRORLEVEL%"
+if not "%INSTALL_EXIT%"=="0" (
+  echo Automatic installation failed with exit code %INSTALL_EXIT%.
+  echo Please run this repair tool again and try once more.
+  echo.
+  pause
+  exit /b 1
+)
+if exist "%PYTHON_INSTALLER_PATH%" del /q "%PYTHON_INSTALLER_PATH%" >nul 2>nul
 echo Installation completed. Retrying...
 exit /b 0
